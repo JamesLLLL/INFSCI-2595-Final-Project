@@ -1,0 +1,327 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part i: Exploration"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preparation
+
+Load tidyverse:
+```{r, load_tidyverse}
+library(tidyverse)
+```
+
+Load x-variables:
+```{r, read_x_variables}
+train_x <- readr::read_csv("train_input_set_x.csv", col_names = TRUE)
+#train_x %>% glimpse()
+```
+
+Load v-variables:
+```{r, read_v_variables}
+train_v <- readr::read_csv("train_input_set_v.csv", col_names = TRUE)
+#train_v %>% glimpse()
+```
+
+Load training outputs:
+```{r, read_output_data}
+train_outputs <- readr::read_csv("train_outputs.csv", col_names = TRUE)
+#train_outputs %>% glimpse()
+```
+
+Load the simplified data set:
+```{r, read_start_data}
+df_start <- readr::read_csv('small_train_data.csv', col_names = TRUE)
+
+#df_start %>% glimpse()
+```
+
+Complie the training set x:
+```{r, make_train_set_x_A}
+ready_x_A <- train_x %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id)
+
+ready_x_A %>% glimpse()
+```
+
+Complie the training set v:
+```{r, make_train_set_v_A}
+ready_v_A <- train_v %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id)
+
+ready_v_A %>% glimpse()
+```
+
+
+### Visualize the distribution of the variables in the data set
+
+
+#### The distributions of the “x-variables” 
+
+```{r, histogram_of_x}
+ready_x_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_histogram(mapping = aes(group = key), bins = 20) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+```{r, boxplot_of_x}
+ready_x_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = key, y = value)) +
+  geom_boxplot() +
+  labs(x = "input name", y = "input value") +
+  theme_bw() 
+```
+
+
+#### The distributions of the “v-variables”
+
+```{r, histogram_of_v}
+ready_v_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_histogram(mapping = aes(group = key), bins = 20) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+```{r, boxplot_of_v}
+ready_v_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = key, y = value)) +
+  geom_boxplot() +
+  labs(x = "input name", y = "input value")  +
+  theme_bw() 
+```
+
+
+### Visualize the distribution of the continuous output
+
+```{r, histogram_output}
+train_outputs %>% 
+  ggplot(mapping = aes(x = response)) +
+  geom_histogram(bins = 20) +
+  theme_bw() 
+```
+
+The counts of the binary output:
+
+```{r, outcome_counts}
+train_outputs %>% count(outcome)
+```
+The outcome is relatively balance.
+
+
+#### The the distributions of the 5 inputs in the “Getting started” simplified design V.S. their distributions in the complete design
+
+```{r, histogram_of_df_start}
+df_start %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_histogram(mapping = aes(group = key), bins = 20) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+```{r, histogram_of_df_start_complete}
+ready_x_A %>% select(x07, x09, x10, x11, x21) %>%
+  tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid) %>%
+  ggplot(mapping = aes(x = value)) +
+  geom_histogram(mapping = aes(group = key), bins = 20) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+The distribuition of x07, x09, x10 and x11 are rather similar, whereas the x21 is different.
+
+
+#### The distribution of the continuous output in the “Getting started” simplified design V.S. its distribution in the complete design
+
+```{r, histogram_start_output}
+df_start %>% 
+  ggplot(mapping = aes(x = response)) +
+  geom_histogram(bins = 20) +
+  theme_bw()   
+```
+
+```{r, histogram_complete_output}
+train_outputs %>% 
+  ggplot(mapping = aes(x = response)) +
+  geom_histogram(bins = 20) +
+  theme_bw() 
+```
+
+The two are pretty similar.
+
+
+#### Consider breaking up the continuous variables based on the binary output
+
+```{r, input_based_on_binary_outputs}
+ready_x_A %>% tibble::rowid_to_column() %>% 
+  tidyr::gather(key = "key", value = "value", -rowid, -response, -outcome) %>% 
+  ggplot(mapping = aes(x = key, y = value)) +
+  geom_boxplot(mapping = aes(fill = outcome,
+                             color = outcome),
+               alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "input name", y = "input value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+From the plot we can see that x05, x09 and x11 have large differences associated with the outcomes. Other variables have relatively similar boxplots.
+
+
+```{r, input_v_based_on_binary_outputs}
+ready_v_A %>% tibble::rowid_to_column() %>% 
+  tidyr::gather(key = "key", value = "value", -rowid, -response, -outcome) %>% 
+  ggplot(mapping = aes(x = key, y = value)) +
+  geom_boxplot(mapping = aes(fill = outcome,
+                             color = outcome),
+               alpha = 0.5) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "input name", y = "input value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+From the plot we can see that v01, v02, v04, v06, v08, v10 and v12 have large differences associated with the outcomes. Other variables have relatively similar boxplots.
+
+
+
+```{r, output_based_on_binary_outputs}
+train_outputs %>% 
+  ggplot(mapping = aes(x = response)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~outcome) +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+From the plot we can see the responses spread from -2 to 1.5 when outcome is event, whereas the responses spread from -0.5 to 1.5 when outcome is non-event. We can draw a line around -0.5 to separate the event an non-event for most of the data.
+
+
+### Visualize the relationships between the “x-variable” inputs
+
+```{r, x_correlation}
+ready_x_A %>% 
+  select(-response, -outcome) %>% 
+  cor() %>% 
+  corrplot::corrplot(method = "number", type = "upper")
+```
+
+No correlation between x-variables.
+
+
+### Visualize the relationships between the “v-variable” inputs
+
+```{r, v_correlation}
+ready_v_A %>% 
+  select(-response, -outcome) %>% 
+  cor() %>% 
+  corrplot::corrplot(method = "number", type = "upper")
+```
+
+Lots of v-variables are highly correlated. v1 to v12 are highly correlated to each other. v13 to v32 are highly correlated to each other. v33 to v41 are highly correlated to each other. 
+
+
+### Visualize the relationships between the continuous output and the “x-variable” inputs and the “v-variable” inputs
+
+```{r, scatter_plots_between_y_and_x}
+ready_x_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(color = "darkorange", fill = "darkorange", alpha = 0.5) +
+  facet_wrap(~key, scales = "free_x") +
+  theme_bw() 
+```
+
+
+```{r, scatter_plots_between_y_and_v}
+ready_v_A %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(color = "darkorange", fill = "darkorange", alpha = 0.5) +
+  facet_wrap(~key, scales = "free_x") +
+  theme_bw() 
+```
+
+
+
+Compare the continuous output relationships to the 5 inputs in the “Getting started” simplified design with the relationships in the 
+complete larger design:
+```{r, scatter_plots_between_y_and_start}
+df_start %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(color = "darkorange", fill = "darkorange", alpha = 0.5) +
+  facet_wrap(~key) +
+  theme_bw() 
+```
+
+```{r, scatter_plots_between_y_and_selected_x}
+ready_x_A %>% select(x07, x09, x10, x11, x21, response) %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(color = "darkorange", fill = "darkorange", alpha = 0.5) +
+  facet_wrap(~key) +
+  theme_bw() 
+```
+
+The overall trend is similar.
+
+
+### Visualize the behavior of the binary outcome with respect to the inputs
+
+```{r, outcome_with_x}
+ready_x_A %>% 
+  tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(mapping = aes(color = outcome)) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+
+```{r, outcome_with_v}
+ready_v_A %>% 
+  tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response, -outcome) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(mapping = aes(color = outcome)) +
+  facet_wrap(~key, scales = "free") +
+  theme_bw() +
+  theme(axis.text.y = element_blank())
+```
+
+The first the plot is the binary outcome with respect to the inputs x. The second the plot is the binary outcome with respect to the inputs v. We can see for xplot, x09 and x11 are more distinguish. For vplot, v01, v02, v04, v06, v08, v10 and v12 are more distinguish.
+
+
+
+
+
+

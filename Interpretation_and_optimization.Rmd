@@ -1,0 +1,309 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part v: Interpretation and “optimization"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_packages}
+library(tidyverse)
+library(coefplot)
+library(tidymodels)
+library(glmnet)
+library(nnet)
+library(ranger)
+library(xgboost)
+library(kernlab)
+library(finetune)
+library(kknn)
+library(vip)
+library(NeuralNetTools)
+```
+
+```{r, parallel}
+if(parallel::detectCores(logical=FALSE) > 3){
+  library(doParallel)
+  
+  num_cores <- parallel::detectCores(logical=FALSE)
+  cl <- makePSOCKcluster(num_cores - 1)
+  registerDoParallel(cl)
+}
+```
+
+Load the best models:
+```{r, load_model}
+nn_regression_x <- readr::read_rds("neural_network_regression_x.rds")
+nn_regression_v <- readr::read_rds("neural_network_regression_v.rds")
+xgb_regression_x <- readr::read_rds("xgb_regression_x.rds")
+xgb_regression_v <- readr::read_rds("xgb_regression_v.rds")
+xgb_classification_x <- readr::read_rds("xgb_classification_x.rds")
+xgb_classification_v <- readr::read_rds("xgb_classification_v.rds")
+```
+
+load the data sets:
+```{r, load_process_x&v_variable}
+train_x <- readr::read_csv("train_input_set_x.csv", col_names = TRUE)
+train_v <- readr::read_csv("train_input_set_v.csv", col_names = TRUE)
+train_outputs <- readr::read_csv("train_outputs.csv", col_names = TRUE)
+ready_x_A <- train_x %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id)
+ready_v_A <- train_v %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id)
+```
+
+### Does the model performance improve if the “v-variables” are used instead of the “x-variables”?
+
+Base on the final results and comparison plots, both regression and classification problem improve performance when the “v-variables” are used instead of the “x-variables”. For regression, the MAE decreases from 0.09262998 to 0.07433819, RMSE decreases from 0.12108967 to 0.09900071, and R-squared increases from 0.97601386 to 0.98392469. For classification, the accuracy increases from 0.9225890 to 0.9368041, mn log loss decreases from 0.1693121 to 0.1405604, and the ROC region increases from 0.9834845 to 0.9892431.
+
+
+### Identify the most important variables associated with your best performing models.
+
+For classification on x:
+```{r, var_imp}
+xgb_classification_x %>% 
+  extract_fit_parsnip() %>% 
+  pluck("fit") %>% 
+  vip(num_features = 20) +
+  theme_bw()
+```
+
+From the plot we can see that x09, x11, x05 and x10 are most important.
+
+
+For classification on v:
+```{r, var_imp2}
+xgb_classification_v %>% 
+  extract_fit_parsnip() %>% 
+  pluck("fit") %>% 
+  vip(num_features = 20) +
+  theme_bw()
+```
+
+From the plot we can see that v10, v12, v02 and v04 are the most important variables.
+
+
+For regression on x, I choose to use gradient boosted tree to visualize. The reason is that neural network gives weird variable importance that is counter intuitive. The most important variable that I got from part 1 and part 2 is x11, but nnet didn't show that. So I decide to use gradient boosted tree.
+
+```{r, var_imp3}
+xgb_regression_x %>% 
+  extract_fit_parsnip() %>% 
+  pluck("fit") %>% 
+  vip(num_features = 20) +
+  theme_bw()
+```
+
+From the plot we can see that x11, x09 are the most important variables.
+
+
+For regression on v:
+```{r, var_imp4}
+xgb_regression_v %>% 
+  extract_fit_parsnip() %>% 
+  pluck("fit") %>% 
+  vip(num_features = 20) +
+  theme_bw()
+```
+
+From the plot we can see that v10, v12, v08 and v06 are the most important variables.
+
+
+### Visualize the predicted continuous output as a function of your identified most important variables.
+
+First we define a prediction grid. Since we have a lot of variables, we have to focus on the most important variables. For that, we'll choose top two variables as our primary variables, and the following two variables as secondary ones. The others will just be the median.
+
+Here are the two functions to create our grids:
+```{r, grid_func}
+make_variable_sequence <- function(xname, xvalues, primary_vars, secondary_vars)
+{
+  if( xname %in% primary_vars ){
+    xrange <- range(xvalues)
+    xvec <- seq(xrange[1], xrange[2], length.out = 25)
+  } else if ( xname %in% secondary_vars ) {
+    xrange <- range(xvalues)
+    xvec <- seq(xrange[1], xrange[2], length.out = 3)
+  } else {
+    xvec <- median(xvalues)
+  }
+  
+  xvec
+}
+
+make_viz_grid_list <- function(primary_vars, secondary_vars, training_inputs)
+{
+  all_names <- training_inputs %>% names()
+  
+  xlist <- purrr::map2(all_names,
+                       training_inputs,
+                       make_variable_sequence,
+                       primary_vars = primary_vars,
+                       secondary_vars = secondary_vars)
+  
+  names(xlist) <- all_names
+  
+  xlist
+}
+```
+
+For the regression on x, We choose x11 as primary, and x09 and x10 as secondary.
+```{r, viz_grid_x_reg}
+viz_grid_list_x_reg <- make_viz_grid_list(primary_vars = c("x11"),
+                                    secondary_vars = c("x09", "x10"),
+                                    training_inputs = ready_x_A %>% select(-outcome))
+
+viz_grid_df_x_reg <- expand.grid(viz_grid_list_x_reg,
+                           KEEP.OUT.ATTRS = FALSE,
+                           stringsAsFactors = FALSE) %>% 
+  as.data.frame() %>% tibble::as_tibble()
+
+viz_grid_df_x_reg %>% glimpse()
+```
+
+Then we will predict the response base on this new data set.
+```{r, predict_x_reg}
+pred_reg_x <- predict(xgb_regression_x, new_data = viz_grid_df_x_reg) 
+pred_reg_x %>% glimpse()
+min(pred_reg_x$.pred)
+```
+
+The visualization of the result:
+```{r, vis_x_reg}
+viz_grid_df_x_reg %>% 
+  bind_cols(pred_reg_x) %>% 
+  ggplot(mapping = aes(x = x11, y = .pred)) +
+  geom_line(mapping = aes(color = as.factor(x10)), size = 1.) +
+  coord_equal() +
+  facet_grid(~ x09, labeller = "label_both") +
+  ggthemes::scale_fill_colorblind() +
+  theme_bw()
+```
+
+
+For the regression on v, We choose v10 as primary, and v08, v12 as secondary.
+```{r, viz_grid_v_reg}
+viz_grid_list_v_reg <- make_viz_grid_list(primary_vars = c("v10"),
+                                    secondary_vars = c("v08", "v12"),
+                                    training_inputs = ready_v_A %>% select(-outcome))
+
+viz_grid_df_v_reg <- expand.grid(viz_grid_list_v_reg,
+                           KEEP.OUT.ATTRS = FALSE,
+                           stringsAsFactors = FALSE) %>% 
+  as.data.frame() %>% tibble::as_tibble()
+
+viz_grid_df_v_reg %>% glimpse()
+```
+
+Then we will predict the response base on this new data set.
+```{r, predict_v_reg}
+pred_reg_v <- predict(xgb_regression_v, new_data = viz_grid_df_v_reg) 
+pred_reg_v %>% glimpse()
+min(pred_reg_v$.pred)
+```
+
+The visualization of the result:
+```{r, vis_v_reg}
+viz_grid_df_v_reg %>% 
+  bind_cols(pred_reg_v) %>% 
+  ggplot(mapping = aes(x = v10, y = .pred)) +
+  geom_line(mapping = aes(color = as.factor(v08)),
+            size = 1.) +
+  coord_equal() +
+  facet_grid(~ v12, labeller = "label_both") +
+  ggthemes::scale_fill_colorblind() +
+  theme_bw()
+```
+
+
+### Visualize the predicted event probability as a function of your identified most important variables
+
+For the classification on x, We choose x09, x11 as primary, and x05, x10 as secondary.
+```{r, viz_grid_x_class}
+viz_grid_x_class <- make_viz_grid_list(primary_vars = c("x09", "x11"),
+                                    secondary_vars = c("x05", "x10"),
+                                    training_inputs = ready_x_A %>% select(-response))
+
+viz_grid_df_x_class <- expand.grid(viz_grid_x_class,
+                           KEEP.OUT.ATTRS = FALSE,
+                           stringsAsFactors = FALSE) %>% 
+  as.data.frame() %>% tibble::as_tibble()
+
+viz_grid_df_x_class %>% glimpse()
+```
+
+Then we will predict the event probability base on this new data set.
+```{r, predict_x_class}
+pred_class_x <- predict(xgb_classification_x, new_data = viz_grid_df_x_class) 
+pred_class_x %>% glimpse()
+```
+
+The visualization of the result:
+```{r, vis_x_class}
+viz_grid_df_x_class %>% 
+  bind_cols(pred_class_x) %>% 
+  ggplot(mapping = aes(x = x09, y = x11)) +
+  geom_raster(mapping = aes(fill = .pred_class)) +
+  coord_equal() +
+  facet_grid(x05 ~ x10, labeller = "label_both") +
+  ggthemes::scale_fill_colorblind() +
+  theme_bw()
+```
+
+
+For the classification on v, We choose v10, v12 as primary, and v02, v04 as secondary.
+```{r, viz_grid_v_class}
+viz_grid_v_class <- make_viz_grid_list(primary_vars = c("v10", "v12"),
+                                    secondary_vars = c("v02", "v04"),
+                                    training_inputs = ready_v_A %>% select(-response))
+
+viz_grid_df_v_class <- expand.grid(viz_grid_v_class,
+                           KEEP.OUT.ATTRS = FALSE,
+                           stringsAsFactors = FALSE) %>% 
+  as.data.frame() %>% tibble::as_tibble()
+
+viz_grid_df_v_class %>% glimpse()
+```
+
+Then we will predict the event probability base on this new data set.
+```{r, predict_v_class}
+pred_class_v <- predict(xgb_classification_v, new_data = viz_grid_df_v_class) 
+pred_class_v %>% glimpse()
+```
+
+The visualization of the result:
+```{r, vis_v_class}
+viz_grid_df_v_class %>% 
+  bind_cols(pred_class_v) %>% 
+  ggplot(mapping = aes(x = v10, y = v12)) +
+  geom_raster(mapping = aes(fill = .pred_class)) +
+  coord_equal() +
+  facet_grid(v02 ~ v04, labeller = "label_both") +
+  ggthemes::scale_fill_colorblind() +
+  theme_bw()
+```
+
+
+###  Based on your visualizations, what input settings are associated with minimizing the continuous output?
+
+From the plot, we can see that x09, x11 are the most important variables that associated with minimizing the continuous output.
+
+
+### Based on your visualizations, what input settings are associated with minimizing the event probability?
+
+From the plot, we can see that v10, v12, v02, v04 are the most important variables that associated with minimizing the event probability.
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,71 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part vi: Test set predictions"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_packages}
+library(tidymodels)
+tidymodels_prefer()
+```
+
+```{r, parallel}
+if(parallel::detectCores(logical=FALSE) > 3){
+  library(doParallel)
+  
+  num_cores <- parallel::detectCores(logical=FALSE)
+  cl <- makePSOCKcluster(num_cores - 1)
+  registerDoParallel(cl)
+}
+```
+
+Load the best models:
+```{r, load_model}
+xgb_regression_v <- readr::read_rds("xgb_regression_v.rds")
+nn_regression_v <- readr::read_rds("neural_network_regression_v.rds")
+xgb_classification_x <- readr::read_rds("xgb_classification_x.rds")
+xgb_classification_v <- readr::read_rds("xgb_classification_v.rds")
+```
+
+load the data sets:
+```{r, load_process_x&v_variable}
+test_x <- readr::read_csv("holdout_inputs_x.csv", col_names = TRUE)
+test_v <- readr::read_csv("holdout_inputs_v.csv", col_names = TRUE)
+```
+
+Make predictions:
+```{r, predict_all}
+pred_reg <- predict(nn_regression_v, test_v) 
+pred_class <- predict(xgb_classification_v, test_v, type = 'class')
+pred_prob <- predict(xgb_classification_v, test_v, type = 'prob')
+```
+
+Compile the predictions into required format:
+```{r, compile_all}
+my_preds <- pred_reg %>% rename(response = .pred) %>% 
+  bind_cols(pred_class %>% 
+              rename(outcome = .pred_class)) %>% 
+  bind_cols(pred_prob %>% 
+              select(probability = .pred_event)) %>% 
+  tibble::rowid_to_column("id")
+my_preds %>% glimpse()
+```
+
+Save the result:
+```{r, svae_pred}
+my_preds %>% readr::write_csv("preds_Jianwei_Liu.csv", col_names = TRUE)
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,759 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part iii: Complete problem regression – iiiB)"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_packages}
+library(tidyverse)
+library(coefplot)
+library(tidymodels)
+library(glmnet)
+library(nnet)
+library(ranger)
+library(xgboost)
+library(kernlab)
+library(finetune)
+library(kknn)
+```
+
+```{r, parallel}
+if(parallel::detectCores(logical=FALSE) > 3){
+  library(doParallel)
+  
+  num_cores <- parallel::detectCores(logical=FALSE)
+  cl <- makePSOCKcluster(num_cores - 1)
+  registerDoParallel(cl)
+}
+```
+
+```{r, load_process_x&v_variable}
+train_v <- readr::read_csv("train_input_set_v.csv", col_names = TRUE)
+train_outputs <- readr::read_csv("train_outputs.csv", col_names = TRUE)
+ready_v_A <- train_v %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id, -outcome)
+```
+
+
+### predict the continuous output with respect to the “v-variables” 
+
+
+#### Linear additive features
+
+```{r, resample}
+set.seed(2021)
+cv_folds <- vfold_cv(ready_v_A, v = 5, repeats = 5)
+
+cv_folds
+```
+
+Define Performance metrics:
+
+```{r, Performance_metrics}
+my_metrics <- metric_set(rmse, rsq, mae)
+```
+
+Define linear models specification:
+
+```{r, linear_models_specification}
+lm_spec <- linear_reg() %>% set_engine("lm")
+```
+
+Preprocess the additive model:
+
+```{r, pre_process_additive}
+bp_additive <- recipe(response ~ ., data = ready_v_A) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+
+bp_additive
+```
+
+Compile the model and pre-processing into a single workflow:
+
+```{r, workflow_additive}
+additive_wflow <- workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Execute the training and testing:
+
+```{r, train_test_additive}
+lm_additive_res <- additive_wflow %>% 
+  fit_resamples(cv_folds, metrics = my_metrics
+)
+
+lm_additive_res %>% collect_metrics()
+```
+
+
+#### All pair-wise interactions between the inputs
+
+Follow the same procedure:
+
+```{r, train_test_pairs}
+bp_pairs <- bp_additive %>% 
+  step_interact( ~ all_predictors():all_predictors())
+
+lm_pairs_wflow <- workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(bp_pairs)
+
+lm_pairs_res <- lm_pairs_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+
+lm_pairs_res %>% collect_metrics()
+```
+
+Add the results to the summary:
+
+```{r, combine_linear_res}
+all_cv_results <- lm_additive_res %>% collect_metrics(summarize = FALSE) %>% 
+  mutate(wflow_id = "lm_add") %>% 
+  bind_rows(lm_pairs_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "lm_pairs"))
+
+all_cv_summaries  <- lm_additive_res %>% collect_metrics(summarize = TRUE) %>% 
+  mutate(wflow_id = "lm_add") %>% 
+  bind_rows(lm_pairs_res %>% collect_metrics(summarize = TRUE) %>% 
+              mutate(wflow_id = "lm_pairs")) 
+```
+
+
+### Penalized regression - Elastic net
+
+#### All pair-wise interactions between the inputs
+
+First we define the search grid:
+
+```{r, define_search_grid}
+my_lambda <- penalty(range = c(-10.5, 2), trans = log_trans())
+my_alpha <- mixture(range = c(0.1, 1.0))
+enet_grid <- grid_regular(my_lambda, my_alpha, 
+                          levels = c(penalty = 75, mixture = 5))
+
+enet_grid %>% glimpse()
+```
+
+Then we define the elastic net model:
+
+```{r, define_elastic_net_model}
+enet_spec <- linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet", 
+             # glmnet specific options
+             intercept = TRUE, standardize.response = TRUE, standardize = TRUE,
+             path_values = exp(seq(-10.5, 2, length.out = 75)))
+```
+
+The workflow for all pair-wise interactions is defined below:
+
+```{r, define_workflow_elastic_pair}
+enet_pairs_wflow <- workflow() %>% 
+  add_model(enet_spec) %>% 
+  add_recipe(bp_pairs)
+```
+
+Train and test the pairs elastic net:
+
+```{r, train_elastic_pair}
+enet_pairs_res <- tune_grid(
+  enet_pairs_wflow,
+  resamples = cv_folds,
+  grid = enet_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+
+```{r, Visualize_elastic_pair}
+enet_pairs_res %>% collect_metrics() %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = "performance metric value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Focus on RMSE and identify the best lambda using “1-standard error rule”:
+
+```{r, Visualize_elastic_pair_rmse}
+enet_pairs_res %>% select_by_one_std_err(desc(penalty), desc(mixture), metric = 'rmse')
+
+enet_pairs_res %>% collect_metrics() %>% 
+  filter(.metric %in% c("rmse")) %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  geom_vline(data = enet_pairs_res %>% select_by_one_std_err(desc(penalty), desc(mixture), metric = 'rmse'),
+             mapping = aes(xintercept = log(penalty)),
+             color = 'red', linetype = 'dashed', size = 1.2) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = 'performance metric value') +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Fit the pairs elastic net with the best tuning parameters:
+
+```{r, fit_best_elastic_pair}
+enet_pairs_lowest_rmse_params <- enet_pairs_res %>% 
+  select_by_one_std_err(desc(penalty), desc(mixture), metric = 'rmse') %>% 
+  select(all_of(names(enet_grid)))
+
+final_enet_pairs_wflow <- enet_pairs_wflow %>% 
+  finalize_workflow(enet_pairs_lowest_rmse_params)
+
+final_enet_pairs_fit <- final_enet_pairs_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_enet_pairs_fit %>% collect_metrics()
+```
+
+#### cubic RSM model with chosen interactions and basis features
+
+Create the cubic RSM model with chosen interactions and basis features:
+
+```{r, create_rsm3}
+bp_rsm3 <- recipe(response ~ v01 + v02 + v04 + v06 + v08 + v10 + v12, data = ready_v_A) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors()) %>%
+  step_poly(all_predictors(), degree = 3,
+            options = list(raw = TRUE)) %>% 
+  step_interact(~ends_with("_poly_1"):ends_with("_poly_1"):ends_with("_poly_1"))
+
+lm_rsm3_wflow <- workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(bp_rsm3)
+
+lm_rsm3_res <- lm_rsm3_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+
+lm_rsm3_res %>% collect_metrics()
+```
+
+Train and test the rsm3 elastic net:
+
+```{r, train_elastic_rsm3}
+enet_rsm3_wflow <- workflow() %>% 
+  add_model(enet_spec) %>% 
+  add_recipe(bp_rsm3)
+
+enet_rsm3_res <- tune_grid(
+  enet_rsm3_wflow,
+  resamples = cv_folds,
+  grid = enet_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+
+```{r, Visualize_elastic_rsm3}
+enet_rsm3_res %>% collect_metrics() %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = "performance metric value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Focus on RMSE and identify the best lambda which minimize the RMSE:
+
+```{r, Visualize_elastic_rsm3_rmse}
+enet_rsm3_res %>% select_best(metric = 'rmse')
+
+enet_rsm3_res %>% collect_metrics() %>% 
+  filter(.metric %in% c("rmse")) %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  geom_vline(data = enet_rsm3_res %>% select_best(metric = 'rmse'),
+             mapping = aes(xintercept = log(penalty)),
+             color = 'red', linetype = 'dashed', size = 1.2) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = 'performance metric value') +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Fit the rsm3 elastic net with the best tuning parameters:
+
+```{r, fit_best_elastic_rsm3}
+enet_rsm3_lowest_rmse_params <- enet_rsm3_res %>% 
+  select_best(metric = 'rmse') %>% 
+  select(all_of(names(enet_grid)))
+
+final_enet_rsm3_wflow <- enet_rsm3_wflow %>% 
+  finalize_workflow(enet_rsm3_lowest_rmse_params)
+
+final_enet_rsm3_fit <- final_enet_rsm3_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_enet_rsm3_fit %>% collect_metrics()
+```
+
+
+Add the result to all_cv_results:
+
+```{r, add_linear_res}
+all_cv_results <- all_cv_results %>% 
+  bind_rows(enet_pairs_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "enet_pairs")) %>% 
+  bind_rows(enet_rsm3_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "enet_rsm3")) 
+
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(enet_pairs_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(enet_pairs_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(enet_pairs_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "enet_pairs")) %>%
+  bind_rows(enet_rsm3_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(enet_rsm3_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(enet_rsm3_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "enet_rsm3"))   
+```
+
+
+### Neural Network
+
+Build neural network using mlp:
+```{r, build_nn}
+nnet_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = 1000) %>% 
+  set_engine("nnet", MaxNWts = 2500, trace=FALSE) %>% 
+  set_mode("regression")
+```
+
+Define neural network workflow:
+```{r, nn_workflow}
+nnet_wflow <- workflow() %>% 
+  add_model(nnet_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Tune the model using Bayesian optimization:
+```{r, tune_nn}
+nn_set <- parameters(nnet_wflow)
+
+
+set.seed(2021)
+nn_res <- nnet_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = nn_set,
+             initial = 5,
+             iter = 10,
+             metrics = my_metrics,
+             control = control_bayes(no_improve = 30, verbose = TRUE))
+```
+
+Visualize the result:
+```{r, Visualize_nn}
+autoplot(nn_res, type = "performance")
+```
+
+Find the best neural network model and fit on the train set:
+```{r, final_nn}
+nn_lowest_rmse_params <- nn_res %>% select_best('rmse')
+
+final_nn_wflow <- nnet_wflow %>% 
+  finalize_workflow(nn_lowest_rmse_params)
+
+final_nn_fit <- final_nn_wflow %>%   
+  fit_resamples(cv_folds, metrics = my_metrics)
+final_nn_fit %>% collect_metrics()
+final_nn_model <- final_nn_wflow %>%  fit(ready_v_A)
+```
+
+Add the result to summary:
+```{r, summary_nn}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(nn_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(nn_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(nn_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "nnet"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(nn_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(nn_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(nn_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "nnet"))
+```
+
+
+### Random forest
+
+Define the model and the workflow:
+```{r, define_random_forest}
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine("ranger") %>% 
+  set_mode('regression')
+
+rf_wflow <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_formula(response ~ .)
+```
+
+Tune the model using Bayesian optimization:
+```{r, tune_rf}
+rf_set <-  rf_spec %>% parameters() %>% finalize(ready_v_A)
+
+set.seed(2021)
+rf_res <- rf_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = rf_set,
+             metrics = my_metrics,
+             initial = 5,
+             iter = 10,
+             control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+
+Visualize the result:
+```{r, vis_random_forest}
+rf_res %>% autoplot()
+```
+
+Find the best random forest model and fit on the train set:
+```{r, fit_final_rf}
+rf_lowest_rmse_params <- rf_res %>% select_best('rmse')
+
+final_rf_spec <- rand_forest(mtry = rf_lowest_rmse_params$mtry,
+                              min_n = rf_lowest_rmse_params$min_n,
+                              trees = 1000) %>% 
+  set_engine('ranger', importance = 'impurity') %>% 
+  set_mode('regression')
+
+final_rf_wflow <- workflow() %>% 
+  add_model(final_rf_spec) %>% 
+  add_formula(response ~ .)
+
+set.seed(2021)
+final_rf_model <-  final_rf_wflow %>%  fit(ready_v_A)
+```
+
+Add to summary:
+```{r, summary_rf}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(rf_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(rf_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(rf_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "rf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(rf_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(rf_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(rf_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "rf"))
+```
+
+
+### Gradient boosted trees
+
+Create gradient boosted trees:
+```{r, define_xgb}
+xgb_spec <- boost_tree(tree_depth = tune(), learn_rate = tune(), 
+                       trees = tune(), mtry = tune(), sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+Define workflow:
+```{r, define_xgb_workflow}
+xgb_wflow <- workflow() %>% 
+  add_model(xgb_spec) %>% 
+  add_formula(response ~ .)
+```
+
+Tune gradient boosted trees using Bayesian optimization:
+```{r, tune_xgb}
+xgb_set <- xgb_wflow %>% parameters() %>% finalize(ready_v_A)
+
+set.seed(2021)
+xgb_res <- xgb_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = xgb_set,
+             initial = 5,
+             iter = 10,
+             metrics = my_metrics,
+             control = control_bayes(no_improve = 5, verbose = TRUE))
+```
+
+Visualize the result:
+```{r, vis_xgb}
+xgb_res %>% autoplot()
+```
+
+Find the best gradient boosted trees model and fit on the train set:
+```{r, fit_final_xgb}
+xgb_lowest_rmse_params <- xgb_res %>% select_best('rmse')
+
+final_xgb_wflow <- xgb_wflow %>% 
+  finalize_workflow(xgb_lowest_rmse_params)
+
+set.seed(2021)
+final_xgb_fit <- final_xgb_wflow %>%   
+  fit_resamples(cv_folds, metrics = my_metrics)
+final_xgb_fit %>% collect_metrics()
+final_xgb_model <- final_xgb_wflow %>% fit(ready_v_A)
+```
+
+Add to summary:
+```{r, summary_xgb}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(xgb_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(xgb_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(xgb_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "xgb"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(xgb_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(xgb_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(xgb_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "xgb"))
+```
+
+
+### Support Vector Machine (SVM)
+
+Define SVM model and workflow:
+```{r, define_svm}
+svm_rbf_spec <- svm_rbf(cost = tune(), rbf_sigma = tune(), margin = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+svm_rbf_wflow <- workflow() %>% 
+  add_model(svm_rbf_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Tune SVM using racing with ANOVA:
+```{r, tune_svm}
+rbf_grid <- crossing(rbf_sigma = c(0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.25, 1.5),
+                     cost = c(0.01, 0.1, 1, 10, 100, 1000),
+                     margin = c(0.01, 0.05, 0.1, 1.0))
+
+#set.seed(2021)
+#svm_rbf_res <- tune_grid(
+#  svm_rbf_wflow,
+#  resamples = cv_folds,
+#  grid = rbf_grid,
+#  metrics = my_metrics
+#)
+
+set.seed(2021)
+svm_rbf_res <- tune_race_anova(
+  svm_rbf_wflow,
+  resamples = cv_folds,
+  grid = rbf_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+```{r, vis_svm}
+svm_rbf_res %>% autoplot()
+```
+
+Identify the best tuning parameters and fit the final model:
+```{r, fit_final_svm}
+svm_lowest_rmse_params <- svm_rbf_res %>% select_best('rmse')
+
+final_svm_rbf_wflow  <- svm_rbf_wflow  %>% 
+  finalize_workflow(svm_lowest_rmse_params)
+
+set.seed(2021)
+final_svm_fit <- final_svm_rbf_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_svm_fit %>% collect_metrics()
+```
+
+Add to summary:
+```{r, summary_svm}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(svm_rbf_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(svm_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(svm_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "svm rbf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(svm_rbf_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(svm_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(svm_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "svm rbf"))
+```
+
+
+### K-nearest neighbors
+
+Create model and workflow:
+```{r, knn_model}
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("kknn")
+
+knn_wflow <- workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_formula(response ~ .)
+```
+
+Tune KNN using racing with ANOVA:
+```{r, tune_knn}
+knn_grid <- crossing(neighbors = seq(1,30),
+                     weight_func = c("rectangular", "triangular", "epanechnikov", "biweight", "triweight", "cos", "inv", "gaussian", "rank", "optimal")) 
+
+set.seed(2021)
+knn_res <- tune_race_anova(
+  knn_wflow,
+  resamples = cv_folds,
+  grid = knn_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+```{r, vis_knn}
+knn_res %>% autoplot()
+```
+
+Identify the best tuning parameters and fit the final model:
+```{r, fit_final_knn}
+knn_lowest_rmse_params <- knn_res %>% select_best('rmse')
+
+final_knn_wflow  <- knn_wflow  %>% 
+  finalize_workflow(knn_lowest_rmse_params)
+
+set.seed(2021)
+final_knn_fit <- final_knn_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_knn_fit %>% collect_metrics()
+knn_lowest_rmse_params
+```
+
+Add to summary:
+```{r, summary_knn}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(knn_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(knn_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(knn_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "knn rbf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(knn_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(knn_lowest_rmse_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(knn_lowest_rmse_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "knn rbf"))
+```
+
+
+### Model comparison
+
+```{r, vis_comparison}
+all_cv_summaries %>% 
+  mutate(wflow_id = forcats::fct_reorder(wflow_id, mean, min)) %>% 
+  ggplot(mapping = aes(x = wflow_id)) +
+  geom_linerange(mapping = aes(ymin = mean - 2*std_err,
+                               ymax = mean + 2*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'grey', size = 1.) +
+  geom_linerange(mapping = aes(ymin = mean - 1*std_err,
+                               ymax = mean + 1*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'red', size = 1.2) +
+  geom_point(mapping = aes(y = mean),
+             color = 'red', size = 2.5) +
+  coord_flip() +
+  facet_wrap(~.metric, scales = "free_x") +
+  labs(y = "performance metric value", x ="") +
+  theme_bw()
+```
+
+From the plot we can see the neural network model performs the best base on MAE, RMSE and R-Squared. The gradient boosted tree is the second, but result is very close.
+
+
+Save the best model:
+```{r, save_model}
+final_nn_model %>% readr::write_rds("neural_network_regression_v.rds")
+final_xgb_model %>% readr::write_rds("xgb_regression_v.rds")
+```
+
+
+
+
+
+

@@ -1,0 +1,266 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part ii: Small problem linear models"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, execution on a local, multicore CPU with excess RAM}
+options(mc.cores = parallel::detectCores())
+```
+
+```{r, load_packages}
+library(tidyverse)
+library(coefplot)
+library(rstanarm)
+library(GGally)
+```
+
+Load the simplified data set:
+```{r, read_start_data}
+df_start <- readr::read_csv('small_train_data.csv', col_names = TRUE)
+```
+
+A glimpse of the data is given below.
+```{r, show_small_df}
+df_start %>% glimpse()
+```
+
+```{r, scatter_plots_between_y_and_x}
+df_start %>% tibble::rowid_to_column() %>%
+  tidyr::gather(key="key", value = "value", -rowid, -response) %>%
+  ggplot(mapping = aes(x = value, y = response)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(color = "darkorange", fill = "darkorange", alpha = 0.5) +
+  facet_wrap(~key) +
+  theme_bw() 
+```
+
+```{r, pair_plot}
+df_start %>%   
+  GGally::ggpairs() + 
+  theme_bw()
+```
+
+### Use lm() to fit linear models
+
+Model1:
+```{r, fit_model01_lm}
+mod01 <- lm(response ~ x07 + x09 + x10 + x11 + x21, data = df_start)
+```
+
+Model2:
+```{r, fit_model02_lm}
+mod02 <- lm(response ~ (.) ^ 2, data = df_start)
+```
+
+Model3:
+```{r, fit_model03_lm}
+mod03 <- lm(response ~ (.) + I(x07 ^ 3) + I(x09 ^ 3) + I(x10 ^ 3) + I(x11 ^ 3) + I(x21 ^ 3), data = df_start)
+```
+
+Model4:
+```{r, fit_model04_lm}
+mod04 <- lm(response ~ I(x07 ^ 2) * x09 + I(x10 ^ 2) * x11 + x21, data = df_start)
+```
+
+Model5:
+```{r, fit_model05_lm}
+mod05 <- lm(response ~ (.) ^ 3 + I(x07 ^ 2) + I(x09 ^ 2) + I(x10 ^ 2) + I(x11 ^ 2) + I(x21 ^ 2) + I(x07 ^ 3) + I(x09 ^ 3) + I(x10 ^ 3) + I(x11 ^ 3) + I(x21 ^ 3), data = df_start)
+```
+
+Model6:
+```{r, fit_model06_lm}
+mod06 <- lm(response ~ splines::ns(x09, 4) + splines::ns(x11, 4) + splines::ns(x07, 4) + splines::ns(x10, 4) + splines::ns(x21, 4), data = df_start)
+```
+
+```{r, select_the_best_model}
+purrr::map_dfr(list(mod01, mod02, mod03, mod04, mod05, mod06), broom::glance) 
+```
+
+### Which of the 6 models is the best? What performance metric did you use to make your selection?
+
+Cubic response surface methods model (mod05) is the best according to R-squared, sigma BIC and AIC.
+
+
+### Visualize the coefficient summaries for your best two models. How do they compare?
+
+```{r, visualize_the_best_models_2}
+coefplot(mod02)
+```
+
+```{r, visualize_the_best_models_5}
+coefplot(mod05)
+summary(mod05)
+```
+
+Comparing two plots, x09:x11, x10:x11, x07:x09 and x10 are significant in model02. x09, x10, x11, x09^2, x11^2, x09^3, x11^3, x09:x10, x09:x11, x10:x11, x07:x10:x11, x09:x10:x11 and x09:x11:x21 are significant in model05. x09, x10, x11 as well as their polynomial and their interactions look very important.
+
+
+### Use Bayesian linear models to fit 2 of the models you fit with lm().
+```{r, Bayesian_fit}
+Bay_mod02 <- stan_lm(response ~ (.) ^ 2, data = df_start,
+                 prior = R2(location = 0.8),
+                 seed = 555)
+Bay_mod05 <- stan_lm(response ~ (.) ^ 3 + I(x07 ^ 2) + I(x09 ^ 2) + I(x10 ^ 2) + I(x11 ^ 2) + I(x21 ^ 2) + I(x07 ^ 3) + I(x09 ^ 3) + I(x10 ^ 3) + I(x11 ^ 3) + I(x21 ^ 3), data = df_start,
+                 prior = R2(location = 0.8),
+                 seed = 555)
+```
+
+```{r, select_best_Baysian_model_R2}
+purrr::map2_dfr(list(Bay_mod02, Bay_mod05),
+                as.character(1:2),
+                function(mod, mod_name){tibble::tibble(rsquared = bayes_R2(mod)) %>% 
+                    mutate(model_name = mod_name)}) %>% 
+  ggplot(mapping = aes(x = rsquared)) +
+  geom_freqpoly(bins = 55,
+                 mapping = aes(color = model_name),
+                 size = 1.1) +
+  theme_bw()
+```
+
+```{r, select_best_Baysian_model_sigma}
+purrr::map2_dfr(list(Bay_mod02, Bay_mod05),
+                as.character(1:2),
+                function(mod, mod_name){as.data.frame(mod) %>% tibble::as_tibble() %>% 
+                    select(sigma) %>% 
+                    mutate(model_name = mod_name)}) %>% 
+  ggplot(mapping = aes(x = sigma)) +
+  geom_freqpoly(bins = 55,
+                 mapping = aes(color = model_name),
+                 size = 1.1) +
+  theme_bw()
+```
+
+```{r, select_the_best_Baysian_model_waic}
+Bay_mod02$waic <- waic(Bay_mod02)
+Bay_mod05$waic <- waic(Bay_mod05)
+
+two_best_models <- stanreg_list(Bay_mod02, Bay_mod05, model_names = c("Pairwise Interactions", "RSM3"))
+loo_compare(two_best_models, criterion = "waic")
+```
+
+Base on the R-squared, sigma and WAIC, the RMS3 model (Bay_mod05) is the best model.
+
+
+```{r, visualize_coeff}
+plot(Bay_mod05)
+```
+
+
+### For your best model: study the uncertainty in the noise (residual error), 𝜎. How does the lm() maximum likelihood estimate (MLE) on 𝜎 relate to the posterior uncertainty on 𝜎?
+
+```{r, Baysian_sigma_summary}
+summary(Bay_mod05)
+```
+
+```{r, Baysian_sigma_quantile}
+as.data.frame(Bay_mod05) %>% tibble::as_tibble() %>% 
+  select(sigma) %>% 
+  pull() %>% 
+  quantile(c(0.05, 0.5, 0.95))
+```
+So the 5th quantile of the sigma is 0.1153699, the median is 0.1307300, and the 95th quantile is 0.1492184.
+
+
+```{r, Baysian_sigma_visualize}
+as.data.frame(Bay_mod05) %>% tibble::as_tibble() %>% 
+  ggplot(mapping = aes(x = sigma)) +
+  geom_histogram(bins = 55) +
+  theme_bw()
+```
+
+
+```{r, non_Baysian_sigma_summary}
+summary(mod05)
+```
+
+```{r, sigma_visualize_comparison}
+as.data.frame(Bay_mod05) %>% tibble::as_tibble() %>% 
+  ggplot(mapping = aes(x = sigma)) +
+  geom_histogram(bins = 55) +
+  geom_vline(xintercept = stats::sigma(mod05),
+             color = "darkorange", linetype = "dashed", size = 1.1) +
+  theme_bw()
+```
+Base on the plot, the lm() maximum likelihood estimate (MLE) on sigma is not exactly located at the median of the posterior uncertainty interval, but still within the 90% posterior uncertainty interval.
+
+
+### Make predictions with the top 2 Bayesian models in order to visualize the trends of the continuous output with respect to the inputs.
+
+
+```{r, create_test_grid}
+viz_grid <- expand.grid(x07 = 0.1,
+                        x09 = c(0.1, 0.2, 0.3, 0.4, 0.5),
+                        x10 = c(0.1, 0.3, 0.9),
+                        x11 = seq(0, 1, length.out = 25),
+                        x21 = 0.1,
+                        KEEP.OUT.ATTRS = FALSE,
+                        stringsAsFactors = FALSE) %>% 
+  as.data.frame() %>% tibble::as_tibble()
+
+viz_grid %>% glimpse()                        
+```
+
+Make prediction with both models:
+
+```{r, def_predict}
+tidy_predict <- function(mod, xnew)
+{
+  pred_df <- predict(mod, xnew, interval = "confidence") %>% 
+    as.data.frame() %>% tibble::as_tibble() %>% 
+    dplyr::select(pred = fit, ci_lwr = lwr, ci_upr = upr) %>% 
+    bind_cols(predict(mod, xnew, interval = 'prediction') %>% 
+                as.data.frame() %>% tibble::as_tibble() %>% 
+                dplyr::select(pred_lwr = lwr, pred_upr = upr))
+  
+  xnew %>% bind_cols(pred_df)
+}
+```
+
+```{r, predict_lm}
+pred_lm_02 <- tidy_predict(mod02, viz_grid)
+pred_lm_05 <- tidy_predict(mod05, viz_grid)
+```
+
+
+Let's first check the prediction on lm_mod02.
+```{r, visualize_lm_02}
+pred_lm_02 %>%
+  ggplot(mapping = aes(x = x11)) +
+  geom_ribbon(mapping = aes(ymin = pred_lwr, ymax = pred_upr), fill = 'orange') +
+  geom_ribbon(mapping = aes(ymin = ci_lwr, ymax = ci_upr), fill = 'grey') +
+  geom_line(mapping = aes(y = pred)) +
+  facet_wrap(x10~x09, labeller = "label_both") 
+```
+
+The three variables are learned quite well.
+
+
+Then let's check lm_mod05.
+
+```{r, visualize_lm_05}
+pred_lm_05 %>%
+  ggplot(mapping = aes(x = x11)) +
+  geom_ribbon(mapping = aes(ymin = pred_lwr, ymax = pred_upr), fill = 'orange') +
+  geom_ribbon(mapping = aes(ymin = ci_lwr, ymax = ci_upr), fill = 'grey') +
+  geom_line(mapping = aes(y = pred)) +
+  facet_wrap(x10~x09, labeller = "label_both") 
+```
+
+The three variables are learned quite well.
+
+From the plots, the predictive trends are pretty similar between the top 2 models I selected. x09 and x11 are  correspond to minimizing the continuous output. I'm confident.
+
+
+
+
+
+
+
+

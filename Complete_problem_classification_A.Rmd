@@ -1,0 +1,945 @@
+---
+title: "INFSCI 2595 Fall 2021 - Final Project"
+subtitle: "Part iv: Complete problem classification – ivA)"
+author: "Jianwei Liu"
+date: "2021/11/6"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_packages}
+library(tidyverse)
+library(coefplot)
+library(tidymodels)
+library(glmnet)
+library(nnet)
+library(ranger)
+library(xgboost)
+library(kernlab)
+library(finetune)
+library(kknn)
+```
+
+```{r, parallel}
+if(parallel::detectCores(logical=FALSE) > 3){
+  library(doParallel)
+  
+  num_cores <- parallel::detectCores(logical=FALSE)
+  cl <- makePSOCKcluster(num_cores - 1)
+  registerDoParallel(cl)
+}
+```
+
+```{r, load_process_x_variable}
+train_x <- readr::read_csv("train_input_set_x.csv", col_names = TRUE)
+train_outputs <- readr::read_csv("train_outputs.csv", col_names = TRUE)
+ready_x_A <- train_x %>% 
+  left_join(train_outputs, by = 'run_id') %>% 
+  select(-run_id, -response)
+```
+
+
+### predict the binary output with respect to the “x-variables” 
+
+#### Linear additive features
+
+```{r, resample}
+set.seed(2021)
+cv_folds <- vfold_cv(ready_x_A, v = 5, repeats = 3)
+
+cv_folds
+```
+Define Performance metrics:
+
+```{r, Performance_metrics}
+my_metrics <- metric_set(accuracy, roc_auc, mn_log_loss)
+```
+
+
+Define linear models specification:
+
+```{r, linear_models_specification}
+glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+```
+
+Preprocess the additive model:
+
+```{r, pre_process_additive}
+bp_additive <- recipe(outcome ~ ., data = ready_x_A) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+
+bp_additive
+```
+Visualize the pre-processed inputs:
+```{r, vis_pre}
+bp_additive %>% 
+  prep(training = ready_x_A, retain = TRUE) %>% 
+  bake(new_data = NULL) %>% 
+  tibble::rowid_to_column() %>% 
+  pivot_longer(!c("rowid", "outcome")) %>% 
+  mutate(input_id = as.numeric(stringr::str_extract(name, '\\d+'))) %>% 
+  ggplot(mapping = aes(x = input_id, y = value)) +
+  geom_boxplot(mapping = aes(group = input_id)) +
+  theme_bw()
+```
+
+Compile the model and pre-processing into a single workflow:
+
+```{r, workflow_additive}
+additive_wflow <- workflow() %>% 
+  add_model(glm_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Execute the training and testing:
+
+```{r, train_test_additive}
+glm_add_res <- additive_wflow %>% 
+  fit_resamples(cv_folds, 
+                metrics = my_metrics,
+                control = control_resamples(save_pred = TRUE))
+
+glm_add_res %>% collect_metrics()
+```
+
+Display the confusion matrix:
+```{r, confusion_matrix_add}
+glm_add_res %>% collect_predictions(summarize = FALSE) %>% 
+  group_nest(id, id2) %>% 
+  mutate(conf_mats = map(data, 
+                         ~ yardstick::conf_mat(.x, truth = outcome, estimate = .pred_class))) %>% 
+  mutate(conf_table = map(conf_mats, ~as.data.frame(.x$table))) %>% 
+  select(id, id2, conf_table) %>% 
+  tidyr::unnest(conf_table) %>% 
+  group_by(id, Prediction, Truth) %>% 
+  summarise(Freq = mean(Freq, na.rm = TRUE),
+            .groups = 'drop') %>% 
+  mutate(Prediction = forcats::fct_rev(Prediction)) %>% 
+  ggplot(mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(mapping = aes(fill = Freq),
+            color = 'black') +
+  geom_text(mapping = aes(label = round(Freq,2)),
+            color = 'white', size = 7.5) +
+  facet_wrap(~id) +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+Visualize the roc curve:
+```{r, roc_add}
+glm_add_res %>% collect_predictions(summarize = FALSE) %>% 
+  group_by(id) %>% 
+  roc_curve(outcome, .pred_event) %>% 
+  autoplot()
+```
+
+
+#### All pair-wise interactions between the inputs
+
+Follow the same procedure:
+
+```{r, train_test_pairs}
+bp_pairs <- bp_additive %>% 
+  step_interact( ~ all_predictors():all_predictors())
+
+glm_pairs_wflow <- workflow() %>% 
+  add_model(glm_spec) %>% 
+  add_recipe(bp_pairs)
+
+glm_pairs_res <- glm_pairs_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics,
+                control = control_resamples(save_pred = TRUE))
+
+glm_pairs_res %>% collect_metrics()
+```
+
+Display the confusion matrix:
+```{r, confusion_matrix_pairs}
+glm_pairs_res %>% collect_predictions(summarize = FALSE) %>% 
+  group_nest(id, id2) %>% 
+  mutate(conf_mats = map(data, 
+                         ~ yardstick::conf_mat(.x, truth = outcome, estimate = .pred_class))) %>% 
+  mutate(conf_table = map(conf_mats, ~as.data.frame(.x$table))) %>% 
+  select(id, id2, conf_table) %>% 
+  tidyr::unnest(conf_table) %>% 
+  group_by(id, Prediction, Truth) %>% 
+  summarise(Freq = mean(Freq, na.rm = TRUE),
+            .groups = 'drop') %>% 
+  mutate(Prediction = forcats::fct_rev(Prediction)) %>% 
+  ggplot(mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(mapping = aes(fill = Freq),
+            color = 'black') +
+  geom_text(mapping = aes(label = round(Freq,2)),
+            color = 'white', size = 7.5) +
+  facet_wrap(~id) +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+Visualize the roc curve:
+```{r, roc_pair}
+glm_pairs_res %>% collect_predictions(summarize = FALSE) %>% 
+  group_by(id) %>% 
+  roc_curve(outcome, .pred_event) %>% 
+  autoplot()
+```
+
+
+Add the linear models to summary:
+
+```{r, combine_linear_res}
+all_cv_results <- glm_add_res %>% collect_metrics(summarize = FALSE) %>% 
+  mutate(wflow_id = "glm_add") %>% 
+  bind_rows(glm_pairs_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "glm_pairs")) 
+
+all_cv_summaries  <- glm_add_res %>% collect_metrics(summarize = TRUE) %>% 
+  mutate(wflow_id = "glm_add") %>% 
+  bind_rows(glm_pairs_res %>% collect_metrics(summarize = TRUE) %>% 
+              mutate(wflow_id = "glm_pairs"))  
+```
+
+
+### Penalized regression - Elastic net
+
+#### All pair-wise interactions between the inputs
+
+The above pair-wise model doesn't perform really well. The reason is that there are two many features!
+
+```{r, show_features}
+model.matrix(outcome ~ (.)^2, ready_x_A) %>% dim()
+```
+
+We need to turn off unimportant inputs by using penalized regression with Elastic Net. First we use lasso to help us set the bound on lambda:
+
+```{r, find_bound}
+lasso_for_fit <- logistic_reg(penalty = 0.1, mixture = 1) %>% 
+  set_engine("glmnet",
+             intercept = TRUE, standardize = TRUE)
+
+lasso_only_wflow <- workflow() %>% 
+  add_model(lasso_for_fit) %>% 
+  add_recipe(bp_additive)
+
+lasso_only_fit <- lasso_only_wflow %>% 
+  fit(ready_x_A)
+
+lasso_only_fit %>% extract_fit_parsnip() %>% 
+  pluck('fit') %>% 
+  plot(xvar = 'lambda')
+
+lasso_only_fit %>% extract_fit_parsnip() %>% 
+  pluck('fit') %>% 
+  broom:::tidy.glmnet() %>% 
+  distinct(lambda) %>% 
+  arrange(lambda) %>% 
+  pull() %>% 
+  log() %>% 
+  summary()
+```
+
+Then we define the search grid:
+```{r, define_search_grid}
+my_lambda <- penalty(range = c(-10, -1), trans = log_trans())
+my_alpha <- mixture(range = c(0.1, 1.0))
+enet_grid <- grid_regular(my_lambda, my_alpha, 
+                          levels = c(penalty = 75, mixture = 5))
+```
+
+Then we define the elastic net model:
+
+```{r, define_elastic_net_model}
+enet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet", 
+             intercept = TRUE, standardize = TRUE,
+             path_values = exp(seq(-10, -1, length.out = 75)))
+```
+
+The workflow for all pair-wise interactions is defined below:
+
+```{r, define_workflow_elastic_pair}
+enet_pairs_wflow <- workflow() %>% 
+  add_model(enet_spec) %>% 
+  add_recipe(bp_pairs)
+```
+
+Train and test the pairs elastic net:
+
+```{r, train_elastic_pair}
+enet_pairs_res <- tune_grid(
+  enet_pairs_wflow,
+  resamples = cv_folds,
+  grid = enet_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+
+```{r, Visualize_elastic_pair}
+enet_pairs_res %>% collect_metrics() %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = "performance metric value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Focus on ROC AUC and identify the best lambda using “1-standard error rule”:
+
+```{r, Visualize_elastic_pair_rmse}
+enet_pairs_res %>% select_by_one_std_err(desc(penalty), desc(mixture), metric = 'roc_auc')
+
+enet_pairs_res %>% collect_metrics() %>% 
+  filter(.metric %in% c("roc_auc")) %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  geom_vline(data = enet_pairs_res %>% select_by_one_std_err(desc(penalty), desc(mixture), metric = 'roc_auc'),
+             mapping = aes(xintercept = log(penalty)),
+             color = 'red', linetype = 'dashed', size = 1.2) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = 'performance metric value') +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+The best tuning parameter set consists of a mixing fraction equal to 0.775.
+
+
+Fit the pairs elastic net with the best tuning parameters:
+
+```{r, fit_best_elastic_pair}
+enet_pairs_best_roc_auc_params <- enet_pairs_res %>% 
+  select_by_one_std_err(desc(penalty), desc(mixture), metric = 'roc_auc') %>% 
+  select(all_of(names(enet_grid)))
+
+final_enet_pairs_wflow <- enet_pairs_wflow %>% 
+  finalize_workflow(enet_pairs_best_roc_auc_params)
+
+final_enet_pairs_fit <- final_enet_pairs_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics,
+                control = control_resamples(save_pred = TRUE))
+final_enet_pairs_fit %>% collect_metrics()
+```
+
+Display the confusion matrix:
+```{r, confusion_matrix_enet_pairs}
+final_enet_pairs_fit %>% collect_predictions(summarize = FALSE) %>% 
+  group_nest(id, id2) %>% 
+  mutate(conf_mats = map(data, 
+                         ~ yardstick::conf_mat(.x, truth = outcome, estimate = .pred_class))) %>% 
+  mutate(conf_table = map(conf_mats, ~as.data.frame(.x$table))) %>% 
+  select(id, id2, conf_table) %>% 
+  tidyr::unnest(conf_table) %>% 
+  group_by(id, Prediction, Truth) %>% 
+  summarise(Freq = mean(Freq, na.rm = TRUE),
+            .groups = 'drop') %>% 
+  mutate(Prediction = forcats::fct_rev(Prediction)) %>% 
+  ggplot(mapping = aes(x = Truth, y = Prediction)) +
+  geom_tile(mapping = aes(fill = Freq),
+            color = 'black') +
+  geom_text(mapping = aes(label = round(Freq,2)),
+            color = 'white', size = 7.5) +
+  facet_wrap(~id) +
+  theme_bw() +
+  theme(legend.position = 'none')
+```
+
+```{r, enet_glm_pairs_compare}
+glm_add_res %>% collect_metrics(summarize = TRUE) %>% 
+  mutate(wflow_id = "GLM") %>% 
+  bind_rows(final_enet_pairs_fit %>% collect_metrics(summarize = TRUE) %>% 
+              mutate(wflow_id = 'ENET')) %>% 
+  ggplot(mapping = aes(x = wflow_id)) +
+  geom_linerange(mapping = aes(ymin = mean - 2*std_err,
+                               ymax = mean + 2*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'grey50', size = 0.75) +
+  geom_linerange(mapping = aes(ymin = mean - 1*std_err,
+                               ymax = mean + 1*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'red', size = 1.45) +
+  geom_point(mapping = aes(y = mean),
+             color = 'red', size = 3.1) +
+  facet_wrap(~.metric, scales = "free_y", nrow = 1) +
+  labs(x = '', y = 'performance metric value') +
+  theme_bw()
+```
+
+Compare the performance between glm model and enet model, we can see that the tuned Elastic Net has a huge improvement over the non-penalized model.
+
+
+#### cubic RSM model with chosen interactions and basis features
+
+Create the cubic RSM model with chosen interactions and basis features:
+
+```{r, define_rsm3_small}
+bp_rsm3_small <- recipe(outcome ~ x07 + x09 + x10 + x11 + x21, data = ready_x_A) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors()) %>%
+  step_poly(all_predictors(), degree = 3,
+            options = list(raw = TRUE)) %>% 
+  step_interact(~ends_with("_poly_1"):ends_with("_poly_1"):ends_with("_poly_1"))
+
+glm_rsm3_small_wflow <- workflow() %>% 
+  add_model(glm_spec) %>% 
+  add_recipe(bp_rsm3_small)
+
+glm_rsm3_small_res <- glm_rsm3_small_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+
+glm_rsm3_small_res %>% collect_metrics()
+```
+
+Train and test the rsm3 elastic net:
+
+```{r, train_elastic_rsm3}
+enet_rsm3_wflow <- workflow() %>% 
+  add_model(enet_spec) %>% 
+  add_recipe(bp_rsm3_small)
+
+enet_rsm3_res <- tune_grid(
+  enet_rsm3_wflow,
+  resamples = cv_folds,
+  grid = enet_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+
+```{r, Visualize_elastic_rsm3}
+enet_rsm3_res %>% collect_metrics() %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = "performance metric value") +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Focus on ROC AUC and identify the best lambda which minimize the RMSE:
+
+```{r, Visualize_elastic_rsm3_roc}
+enet_rsm3_res %>% select_best(metric = 'roc_auc')
+
+enet_rsm3_res %>% collect_metrics() %>% 
+  filter(.metric %in% c("roc_auc")) %>% 
+  ggplot(mapping = aes(x = log(penalty))) +
+  geom_ribbon(mapping = aes(ymin = mean - std_err,
+                            ymax = mean + std_err,
+                            group = interaction(mixture, .metric),
+                            fill = as.factor(mixture)),
+              alpha = 0.35) +
+  geom_line(mapping = aes(y = mean,
+                          group = interaction(mixture, .metric),
+                          color = as.factor(mixture)),
+            size = 1.15) +
+  geom_vline(data = enet_rsm3_res %>% select_best(metric = 'roc_auc'),
+             mapping = aes(xintercept = log(penalty)),
+             color = 'red', linetype = 'dashed', size = 1.2) +
+  facet_wrap(~.metric, scales = "free_y", ncol = 1) +
+  scale_fill_viridis_d("mixing fraction") +
+  scale_color_viridis_d("mixing fraction") +
+  labs(y = 'performance metric value') +
+  theme_bw() +
+  theme(legend.position = "top")
+```
+
+Fit the rsm3 elastic net with the best tuning parameters:
+
+```{r, fit_best_elastic_rsm3}
+enet_rsm3_best_roc_params <- enet_rsm3_res %>% 
+  select_best(metric = 'roc_auc') %>% 
+  select(all_of(names(enet_grid)))
+
+final_enet_rsm3_wflow <- enet_rsm3_wflow %>% 
+  finalize_workflow(enet_rsm3_best_roc_params)
+
+final_enet_rsm3_fit <- final_enet_rsm3_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_enet_rsm3_fit %>% collect_metrics()
+```
+
+
+Add the result to all_cv_results:
+
+```{r, add_linear_res}
+all_cv_results <- all_cv_results %>% 
+  bind_rows(enet_pairs_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "enet_pairs")) %>% 
+  bind_rows(enet_rsm3_res %>% collect_metrics(summarize = FALSE) %>% 
+              mutate(wflow_id = "enet_rsm3_small")) 
+
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(enet_pairs_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(enet_pairs_best_roc_auc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(enet_pairs_best_roc_auc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "enet_pairs")) %>%
+  bind_rows(enet_rsm3_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(enet_rsm3_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(enet_rsm3_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "enet_rsm3_small"))   
+```
+
+
+### Neural Network
+
+Build neural network using mlp:
+```{r, build_nn}
+nnet_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = 2000) %>% 
+  set_engine("nnet", MaxNWts = 2500, trace=FALSE) %>% 
+  set_mode("classification")
+```
+
+Define neural network workflow:
+```{r, nn_workflow}
+nnet_wflow <- workflow() %>% 
+  add_model(nnet_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Tune the model using Bayesian optimization:
+```{r, tune_nn}
+nn_set <- parameters(nnet_wflow)
+nn_set <- nn_set %>%
+  update(hidden_units = hidden_units(c(0L, 30L)),
+         penalty = penalty(c(-2L,2L)))
+
+set.seed(2021)
+nn_res <- nnet_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = nn_set,
+             initial = 5,
+             iter = 30,
+             metrics = my_metrics,
+             control = control_bayes(no_improve = 10, verbose = TRUE))
+```
+
+Visualize the result:
+```{r, Visualize_nn}
+autoplot(nn_res)
+```
+
+Find the best neural network model and fit on the train set:
+```{r, final_nn}
+nn_best_roc_params <- nn_res %>% select_best('roc_auc')
+
+final_nn_wflow <- nnet_wflow %>% 
+  finalize_workflow(nn_best_roc_params)
+
+final_nn_fit <- final_nn_wflow %>%   
+  fit_resamples(cv_folds, metrics = my_metrics)
+final_nn_fit %>% collect_metrics()
+final_nn_model <- final_nn_fit <- final_nn_wflow %>%  fit(ready_x_A)
+```
+
+Add the result to summary:
+```{r, summary_nn}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(nn_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(nn_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(nn_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "nnet"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(nn_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(nn_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(nn_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "nnet"))
+```
+
+
+### Random forest
+
+Define the model and the workflow:
+```{r, define_random_forest}
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>% 
+  set_engine("ranger") %>% 
+  set_mode('classification')
+
+stan_add <- recipe(outcome ~ ., data = ready_x_A) 
+rf_wflow <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(stan_add)
+```
+
+Tune the model using Bayesian optimization:
+```{r, tune_rf}
+rf_set <-  rf_spec %>% parameters(rf_wflow) %>% finalize(ready_x_A)     
+
+set.seed(2021)
+rf_res <- rf_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = rf_set,
+             metrics = my_metrics,
+             initial = 5,
+             iter = 20,
+             control = control_bayes(no_improve = 10, verbose = TRUE))
+```
+
+Visualize the result:
+```{r, vis_random_forest}
+rf_res %>% autoplot()
+```
+
+Find the best random forest model and fit on the train set:
+```{r, fit_final_rf}
+rf_best_roc_params <- rf_res %>% select_best('roc_auc')
+
+final_rf_spec <- rand_forest(mtry = rf_best_roc_params$mtry,
+                              min_n = rf_best_roc_params$min_n,
+                              trees = 500) %>% 
+  set_engine('ranger', importance = 'impurity') %>% 
+  set_mode('classification')
+
+final_rf_wflow <- workflow() %>% 
+  add_model(final_rf_spec) %>% 
+  add_recipe(stan_add)
+
+set.seed(2021)
+final_rf_model <-  final_rf_wflow %>%  fit(ready_x_A)
+```
+
+Add to summary:
+```{r, summary_rf}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(rf_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(rf_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(rf_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "rf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(rf_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(rf_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(rf_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "rf"))
+```
+
+
+### Gradient boosted trees
+
+Create gradient boosted trees:
+```{r, define_xgb}
+xgb_spec <- boost_tree(tree_depth = tune(), learn_rate = tune(), 
+                       trees = tune(), mtry = tune(), sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+```
+
+Define workflow:
+```{r, define_xgb_workflow}
+xgb_wflow <- workflow() %>% 
+  add_model(xgb_spec) %>% 
+  add_recipe(stan_add)
+```
+
+Tune gradient boosted trees using Bayesian optimization:
+```{r, tune_xgb}
+xgb_set <- xgb_wflow %>% parameters() %>% finalize(ready_x_A)
+
+set.seed(2021)
+xgb_res <- xgb_wflow %>%
+  tune_bayes(resamples = cv_folds,
+             param_info = xgb_set,
+             initial = 5,
+             iter = 20,
+             metrics = my_metrics,
+             control = control_bayes(no_improve = 10, verbose = TRUE))
+```
+
+Visualize the result:
+```{r, Visualize_xgb}
+autoplot(xgb_res)
+```
+
+Find the best gradient boosted trees model and fit on the train set:
+```{r, fit_final_xgb}
+xgb_best_roc_params <- xgb_res %>% select_best('roc_auc')
+
+final_xgb_wflow <- xgb_wflow %>% 
+  finalize_workflow(xgb_best_roc_params)
+
+set.seed(2021)
+final_xgb_resample <- final_xgb_wflow %>%   
+  fit_resamples(cv_folds, metrics = my_metrics)
+final_xgb_resample %>% collect_metrics()
+
+final_xgb_fit <- final_xgb_wflow %>%  fit(ready_x_A)
+```
+
+Add to summary:
+```{r, summary_xgb}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(xgb_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(xgb_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(xgb_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "xgb"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(xgb_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(xgb_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(xgb_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "xgb"))
+```
+
+
+### Support Vector Machine (SVM)
+
+Define SVM model and workflow:
+```{r, define_svm}
+svm_rbf_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+svm_rbf_wflow <- workflow() %>% 
+  add_model(svm_rbf_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Tune SVM using racing with ANOVA:
+```{r, tune_svm}
+rbf_grid <- crossing(rbf_sigma = c(0.005, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.25),
+                     cost = c(0.01, 0.1, 1, 10, 100, 1000))
+
+set.seed(2021)
+svm_rbf_res <- tune_race_anova(
+  svm_rbf_wflow,
+  resamples = cv_folds,
+  grid = rbf_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+```{r, Visualize_svm}
+autoplot(svm_rbf_res)
+```
+
+Identify the best tuning parameters and fit the final model:
+```{r, fit_final_svm}
+svm_best_params <- svm_rbf_res %>% select_best('roc_auc')
+
+final_svm_rbf_wflow  <- svm_rbf_wflow  %>% 
+  finalize_workflow(svm_best_params)
+
+set.seed(2021)
+final_svm_fit <- final_svm_rbf_wflow %>%  fit(ready_x_A)
+```
+
+Add to summary:
+```{r, summary_svm}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(svm_rbf_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(svm_best_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(svm_best_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "svm rbf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(svm_rbf_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(svm_best_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(svm_best_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "svm rbf"))
+```
+
+
+### K-nearest neighbors
+
+Create model and workflow:
+```{r, knn_model}
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+knn_wflow <- workflow() %>% 
+  add_model(knn_spec) %>% 
+  add_recipe(bp_additive)
+```
+
+Tune KNN using racing with ANOVA:
+```{r, tune_knn}
+knn_grid <- crossing(neighbors = seq(1,100),
+                     weight_func = c("rectangular", "triangular", "epanechnikov", "biweight", "triweight", "cos", "inv", "gaussian", "rank", "optimal")) 
+
+set.seed(2021)
+knn_res <- tune_race_anova(
+  knn_wflow,
+  resamples = cv_folds,
+  grid = knn_grid,
+  metrics = my_metrics
+)
+```
+
+Visualize the result:
+```{r, Visualize_knn}
+autoplot(knn_res)
+```
+
+Identify the best tuning parameters and fit the final model:
+```{r, fit_final_knn}
+knn_best_roc_params <- knn_res %>% select_best('roc_auc')
+
+final_knn_wflow  <- knn_wflow  %>% 
+  finalize_workflow(knn_best_roc_params)
+
+set.seed(2021)
+final_knn_fit <- final_knn_wflow %>%  fit(ready_x_A)
+
+final_knn_fit <- final_knn_wflow %>% 
+  fit_resamples(cv_folds,
+                metrics = my_metrics)
+final_knn_fit %>% collect_metrics()
+knn_best_roc_params
+```
+
+Add to summary:
+```{r, summary_knn}
+all_cv_summaries <- all_cv_summaries %>% 
+  bind_rows(knn_res %>% collect_metrics(summarize = TRUE) %>% 
+              inner_join(knn_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(knn_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "knn rbf"))
+
+all_cv_results <- all_cv_results %>% 
+  bind_rows(knn_res %>% collect_metrics(summarize = FALSE) %>% 
+              inner_join(knn_best_roc_params %>% 
+                           mutate(keep_these = 'yes'),
+                         by = names(knn_best_roc_params)) %>% 
+              select(-keep_these) %>% 
+              mutate(wflow_id = "knn rbf"))
+```
+
+
+### Deep neural network using Torch
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Model comparison
+
+```{r, acc_comparison}
+all_cv_summaries %>% 
+  filter(.metric == "accuracy") %>% 
+  mutate(wflow_id = stringr::str_replace(wflow_id, " ", "\n")) %>% 
+  mutate(wflow_id = forcats::fct_reorder(wflow_id, mean, min)) %>% 
+  ggplot(mapping = aes(x = wflow_id)) +
+  geom_linerange(mapping = aes(ymin = mean - 2*std_err,
+                               ymax = mean + 2*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'grey', size = 1.) +
+  geom_linerange(mapping = aes(ymin = mean - 1*std_err,
+                               ymax = mean + 1*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'red', size = 1.2) +
+  geom_point(mapping = aes(y = mean),
+             color = 'red', size = 3.5) +
+  facet_wrap(~.metric) +
+  labs(x = '', y = 'value') +
+  theme_bw()
+```
+
+From the accuracy plot we can see the Gradient boosted tree model performs the best.  The second best is regularized pair-wise model. Then third is neural network model.
+
+
+```{r, acc_comparison2}
+all_cv_summaries %>% 
+  filter(.metric == "roc_auc") %>% 
+  mutate(wflow_id = stringr::str_replace(wflow_id, " ", "\n")) %>% 
+  mutate(wflow_id = forcats::fct_reorder(wflow_id, mean, min)) %>% 
+  ggplot(mapping = aes(x = wflow_id)) +
+  geom_linerange(mapping = aes(ymin = mean - 2*std_err,
+                               ymax = mean + 2*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'grey', size = 1.) +
+  geom_linerange(mapping = aes(ymin = mean - 1*std_err,
+                               ymax = mean + 1*std_err,
+                               group = interaction(.metric, wflow_id)),
+                 color = 'red', size = 1.2) +
+  geom_point(mapping = aes(y = mean),
+             color = 'red', size = 3.5) +
+  facet_wrap(~.metric) +
+  labs(x = '', y = 'value') +
+  theme_bw()
+```
+
+Based on the ROC plot, the Gradient boosted tree model still has the best performance. The second best is regularized pair-wise model. Then third is random forest model.
+
+
+Save the best model:
+```{r, save_model}
+final_xgb_fit %>% readr::write_rds("xgb_classification_x.rds")
+```
+
+
+
